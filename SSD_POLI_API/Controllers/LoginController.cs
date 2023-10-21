@@ -1,6 +1,9 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-
-// For more information on enabling Web API for empty projects, visit https://go.microsoft.com/fwlink/?LinkID=397860
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using System.Security.Cryptography;
 
 namespace SSD_POLI_API.Controllers
 {
@@ -8,36 +11,178 @@ namespace SSD_POLI_API.Controllers
     [ApiController]
     public class LoginController : ControllerBase
     {
-        // GET: api/<ValuesController>
+        private readonly ApplicationDbContext _context;
+        private readonly IConfiguration _configuration;
+
+        public LoginController(ApplicationDbContext context, IConfiguration configuration)
+        {
+            _context = context;
+            _configuration = configuration;
+        }
+
         [HttpGet]
-        public IEnumerable<string> Get()
+        public IActionResult Get([FromQuery] string email, [FromQuery] string password)
         {
-            return new string[] { "value1", "value2" };
+            var user = _context.LoginUser.FirstOrDefault(u => u.Email == email);
+
+            if (user != null)
+            {
+                try
+                {
+                    if (IsBase64String(user.Password))
+                    {
+                        byte[] storedSaltAndHash = Convert.FromBase64String(user.Password);
+                        byte[] storedSalt = new byte[16];
+                        byte[] storedHash = new byte[32];
+                        Array.Copy(storedSaltAndHash, 0, storedSalt, 0, 16);
+                        Array.Copy(storedSaltAndHash, 16, storedHash, 0, 32);
+
+                        int iterations = 10000;
+                        using (var pbkdf2 = new Rfc2898DeriveBytes(password, storedSalt, iterations))
+                        {
+                            byte[] newHash = pbkdf2.GetBytes(32);
+
+                            if (newHash.SequenceEqual(storedHash))
+                            {
+                                var claims = new[]
+                                {
+                                    new Claim(ClaimTypes.Name, email),
+                                };
+
+                                var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["Jwt:SecretKey"]));
+
+                                var tokenDescriptor = new SecurityTokenDescriptor
+                                {
+                                    Subject = new ClaimsIdentity(claims),
+                                    Expires = DateTime.UtcNow.AddHours(1),
+                                    SigningCredentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256Signature)
+                                };
+
+                                var tokenHandler = new JwtSecurityTokenHandler();
+                                var token = tokenHandler.CreateToken(tokenDescriptor);
+
+                                var tokenString = tokenHandler.WriteToken(token);
+
+                                return Ok(new { Token = tokenString, isAdmin = user.isAdmin });
+                            }
+                            else
+                            {
+                                return NotFound("Invalid password.");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        return BadRequest("Invalid password format in the database.");
+                    }
+                }
+                catch (FormatException ex)
+                {
+                    return BadRequest($"Error: Invalid Base64 format for stored password. {ex.Message}");
+                }
+            }
+
+            return NotFound("User not found.");
         }
 
-        // GET api/<ValuesController>/5
-        [HttpGet("{id}")]
-        public string Get(int id)
+        private bool IsBase64String(string base64)
         {
-            return "value";
+            try
+            {
+                Convert.FromBase64String(base64);
+                return true;
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
         }
 
-        // POST api/<ValuesController>
+        [HttpGet("/api/CheckUserIfAdmin")]
+        public IActionResult GetIsAdmin()
+        {
+
+            var token = Request.Headers["Authorization"].FirstOrDefault()?.Replace("Bearer ", "");
+
+            if (string.IsNullOrEmpty(token))
+            {
+
+                return Unauthorized("No token provided.");
+            }
+
+            try
+            {
+                var tokenHandler = new JwtSecurityTokenHandler();
+                var key = Encoding.UTF8.GetBytes(_configuration["Jwt:SecretKey"]);
+                var validationParameters = new TokenValidationParameters
+                {
+                    IssuerSigningKey = new SymmetricSecurityKey(key),
+                    ValidateIssuer = false,
+                    ValidateAudience = false,
+                };
+
+                var principal = tokenHandler.ValidateToken(token, validationParameters, out _);
+
+
+                var email = principal.Identity.Name;
+
+
+                var user = _context.LoginUser.FirstOrDefault(u => u.Email == email);
+
+                if (user != null)
+                {
+                    return Ok(user.isAdmin);
+                }
+                else
+                {
+                    return NotFound("User not found.");
+                }
+            }
+            catch (Exception ex)
+            {
+
+                return BadRequest($"JWT validation failed: {ex.Message}");
+            }
+        }
+
+
         [HttpPost]
-        public void Post([FromBody] string value)
+        public IActionResult Post([FromQuery] string name, [FromQuery] string email, [FromQuery] string password)
         {
-        }
+            try
+            {
+                byte[] salt = new byte[16];
+                using (var rng = new RNGCryptoServiceProvider())
+                {
+                    rng.GetBytes(salt);
+                }
 
-        // PUT api/<ValuesController>/5
-        [HttpPut("{id}")]
-        public void Put(int id, [FromBody] string value)
-        {
-        }
 
-        // DELETE api/<ValuesController>/5
-        [HttpDelete("{id}")]
-        public void Delete(int id)
-        {
+                int iterations = 10000;
+                using (var pbkdf2 = new Rfc2898DeriveBytes(password, salt, iterations))
+                {
+                    byte[] hash = pbkdf2.GetBytes(32);
+                    byte[] saltAndHash = new byte[48];
+                    Array.Copy(salt, 0, saltAndHash, 0, 16);
+                    Array.Copy(hash, 0, saltAndHash, 16, 32);
+
+                    var newUser = new LoginModel
+                    {
+                        Name = name,
+                        Email = email,
+                        Password = Convert.ToBase64String(saltAndHash)
+                    };
+
+                    _context.LoginUser.Add(newUser);
+                    _context.SaveChanges();
+
+                    return Ok("User created successfully.");
+                }
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"Error: {ex.Message}");
+            }
         }
     }
 }
